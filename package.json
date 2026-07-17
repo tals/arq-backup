@@ -1,0 +1,32 @@
+{
+  "name": "arq-restore",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "ARQ_RESTORE_ENV=production bun src/index.ts",
+    "build": "bun run build.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "import:arq": "bun src/cli/import-arq-credentials.ts"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.3",
+    "bun-plugin-tailwind": "^0.1.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.545.0",
+    "react": "^19",
+    "react-dom": "^19",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/bun": "latest",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.9.3",
+    "tw-animate-css": "^1.4.0"
+  }
+}
