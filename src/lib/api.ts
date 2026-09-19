@@ -4,6 +4,7 @@ import type {
   ArchiveEntrySummary,
   ArchiveProbe,
   ArchiveSearchResponse,
+  ArchiveUnlockProgress,
   CloudBucket,
   RestoreJobSummary,
   RestoreQueueSnapshot,
@@ -38,16 +39,23 @@ export async function getArchiveProbe(bucket: CloudBucket, signal?: AbortSignal)
 export async function unlockArchive(
   bucket: CloudBucket,
   planId: string,
-  format: "arq5" | "arq7",
+  format: "arq5" | "arq6" | "arq7",
   password: string,
+  onProgress?: (progress: ArchiveUnlockProgress) => void,
   signal?: AbortSignal,
 ): Promise<UnlockedArchive> {
-  return requestJson<UnlockedArchive>("/api/archive/unlock", {
+  const response = await fetch("/api/archive/unlock", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ connectionId: bucket.connectionId, bucketId: bucket.id, planId, format, password }),
     signal,
+    cache: "no-store",
   });
+  if (!response.ok) await throwApiError(response);
+  if (response.headers.get("Content-Type")?.includes("application/x-ndjson")) {
+    return readUnlockStream(response, onProgress);
+  }
+  return (await response.json()) as UnlockedArchive;
 }
 
 export async function getArchiveChildren(
@@ -94,11 +102,12 @@ export async function enqueueRestore(
   sessionId: string,
   token: string,
   destinationDirectory: string,
+  relativePath: string,
 ): Promise<RestoreJobSummary> {
   return (await requestJson<{ job: RestoreJobSummary }>("/api/restore/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, token, destinationDirectory }),
+    body: JSON.stringify({ sessionId, token, destinationDirectory, relativePath }),
   })).job;
 }
 
@@ -120,6 +129,50 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
     await throwApiError(response);
   }
   return (await response.json()) as T;
+}
+
+type ArchiveUnlockStreamEvent =
+  | { type: "progress"; progress: ArchiveUnlockProgress }
+  | { type: "complete"; archive: UnlockedArchive }
+  | { type: "error"; status: number; error: ApiErrorPayload["error"] };
+
+async function readUnlockStream(
+  response: Response,
+  onProgress?: (progress: ArchiveUnlockProgress) => void,
+): Promise<UnlockedArchive> {
+  if (!response.body) throw new ApiError("empty_unlock_stream", "The server returned no unlock result.", 500);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let archive: UnlockedArchive | null = null;
+
+  const processLine = (line: string) => {
+    if (!line.trim()) return;
+    let event: ArchiveUnlockStreamEvent;
+    try {
+      event = JSON.parse(line) as ArchiveUnlockStreamEvent;
+    } catch {
+      throw new ApiError("invalid_unlock_stream", "The server returned invalid unlock progress.", 500);
+    }
+    if (event.type === "progress") onProgress?.(event.progress);
+    else if (event.type === "complete") archive = event.archive;
+    else if (event.type === "error") throw new ApiError(event.error.code, event.error.message, event.status);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      processLine(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+    if (done) break;
+  }
+  processLine(buffer);
+  if (!archive) throw new ApiError("incomplete_unlock_stream", "The unlock operation ended before it completed.", 500);
+  return archive;
 }
 
 async function throwApiError(response: Response): Promise<never> {

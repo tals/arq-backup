@@ -22,6 +22,7 @@ import type {
   ArchiveProbe,
   ArchiveSearchResponse,
   ArchiveSearchResult,
+  ArchiveUnlockProgress,
   BackupFolderSummary,
   BackupPlanSummary,
   CloudBucket,
@@ -66,6 +67,7 @@ const emptyStatus: Loadable<AppStatus> = { state: "loading", value: null, error:
 const emptyBuckets: Loadable<CloudBucket[]> = { state: "idle", value: null, error: null };
 const emptyRestoreQueue: RestoreQueueSnapshot = { concurrency: 4, activeWorkers: 0, jobs: [] };
 type UnlockedSelection = { archive: UnlockedArchive; backupKey: string; generation: number };
+type ArchiveRestoreTarget = { entry: ArchiveEntrySummary; relativePath: string };
 
 export function App() {
   const [status, setStatus] = useState<Loadable<AppStatus>>(emptyStatus);
@@ -214,14 +216,14 @@ export function App() {
     }
   };
 
-  const queueRestore = async (archive: UnlockedArchive, entry: ArchiveEntrySummary) => {
+  const queueRestore = async (archive: UnlockedArchive, target: ArchiveRestoreTarget) => {
     let destination = restoreDestination.trim();
     if (!destination) destination = await pickRestoreDestination() ?? "";
     if (!destination) return;
     setQueueOpen(true);
     setRestoreError(null);
     try {
-      await enqueueRestore(archive.sessionId, entry.token, destination);
+      await enqueueRestore(archive.sessionId, target.entry.token, destination, target.relativePath);
       await refreshRestoreQueue();
     } catch (error) {
       setRestoreError(messageFor(error));
@@ -317,7 +319,7 @@ export function App() {
             unlockedArchive={unlockedArchive}
             selectedFolderId={selectedFolderId}
             onSelectFolder={setSelectedFolderId}
-            onRestore={entry => unlockedArchive && void queueRestore(unlockedArchive, entry)}
+            onRestore={target => unlockedArchive && void queueRestore(unlockedArchive, target)}
             onUnlocked={acceptUnlockedArchive}
             onLocked={sessionId => setUnlockedSelection(current =>
               current?.archive.sessionId === sessionId ? null : current
@@ -420,6 +422,11 @@ function BucketNavigation({
                     >
                       <FolderClock className="size-3.5" />
                       <span className="truncate">{plan.name}</span>
+                      {plan.format === "arq6" ? (
+                        <span className="rounded bg-amber-100 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                          Experimental
+                        </span>
+                      ) : null}
                       {plan.locked && !(selectedPlan?.id === plan.id && unlockedArchive) ? <LockKeyhole className="ml-auto size-3" /> : null}
                     </button>
                     {selectedPlan?.id === plan.id && unlockedArchive ? (
@@ -475,7 +482,7 @@ function Workspace({
   unlockedArchive: UnlockedArchive | null;
   selectedFolderId: string;
   onSelectFolder: (folderId: string) => void;
-  onRestore: (entry: ArchiveEntrySummary) => void;
+  onRestore: (target: ArchiveRestoreTarget) => void;
   onUnlocked: (archive: UnlockedArchive, sourceBackupKey: string, sourceGeneration: number) => void;
   onLocked: (sessionId: string) => void;
   onSelectPlan: (plan: BackupPlanSummary) => void;
@@ -547,7 +554,7 @@ function ArchiveContent({
   unlockedArchive: UnlockedArchive | null;
   selectedFolderId: string;
   onSelectFolder: (folderId: string) => void;
-  onRestore: (entry: ArchiveEntrySummary) => void;
+  onRestore: (target: ArchiveRestoreTarget) => void;
   onSelectPlan: (plan: BackupPlanSummary) => void;
   onUnlocked: (archive: UnlockedArchive, sourceBackupKey: string, sourceGeneration: number) => void;
   onLocked: (sessionId: string) => void;
@@ -613,7 +620,14 @@ function ArchiveContent({
                 <FolderClock className="size-4" />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium">{plan.name}</div>
+                <div className="flex items-center gap-2">
+                  <div className="truncate text-sm font-medium">{plan.name}</div>
+                  {plan.format === "arq6" ? (
+                    <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                      Experimental
+                    </span>
+                  ) : null}
+                </div>
                 <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{plan.id}</div>
               </div>
               <LockKeyhole className="size-4 text-muted-foreground" />
@@ -644,6 +658,7 @@ function UnlockPlan({
   const [password, setPassword] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ArchiveUnlockProgress | null>(null);
 
   if (format === "arq-legacy") {
     return (
@@ -666,8 +681,20 @@ function UnlockPlan({
     event.preventDefault();
     setWorking(true);
     setError(null);
+    setProgress(format === "arq5" ? {
+      phase: "indexing_legacy_tree_packs",
+      indexTotalKnown: false,
+      indexedPackIndexes: 0,
+      totalPackIndexes: 0,
+      packCacheMisses: 0,
+      downloadedPacks: 0,
+    } : null);
     try {
-      onUnlocked(await unlockArchive(bucket, plan.id, format, password), backupKey(bucket, plan), selectionGeneration);
+      onUnlocked(
+        await unlockArchive(bucket, plan.id, format, password, setProgress),
+        backupKey(bucket, plan),
+        selectionGeneration,
+      );
       setPassword("");
     } catch (nextError) {
       setError(messageFor(nextError));
@@ -686,6 +713,12 @@ function UnlockPlan({
         <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
           The password and derived keys will remain only in Bun process memory for this session.
         </p>
+        {format === "arq6" ? (
+          <div className="mt-4 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <div className="font-semibold">Experimental Arq 6 reader</div>
+            <div>Built from the published format and Arq 6 application behavior, but not yet verified against a real test archive. Cloud access remains read-only.</div>
+          </div>
+        ) : null}
         <form className="mt-5 space-y-3" onSubmit={submit}>
           <Input
             type="password"
@@ -697,10 +730,13 @@ function UnlockPlan({
             disabled={working}
             autoFocus
           />
+          {working && format === "arq5" && progress ? <LegacyTreePackProgress progress={progress} /> : null}
           {error ? <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs leading-5 text-destructive">{error}</div> : null}
           <Button className="w-full" disabled={working}>
             {working ? <LoaderCircle className="animate-spin" /> : <LockKeyhole />}
-            {working ? (format === "arq5" ? "Indexing legacy tree packs…" : "Opening backup…") : `Unlock ${format === "arq5" ? "legacy backup" : "Arq 7"}`}
+            {working
+              ? format === "arq5" ? "Indexing legacy tree packs…" : format === "arq6" ? "Opening experimental snapshot…" : "Opening backup…"
+              : `Unlock ${format === "arq5" ? "legacy backup" : format === "arq6" ? "Arq 6 (Experimental)" : "Arq 7"}`}
           </Button>
         </form>
         <p className="mt-3 text-center text-[11px] text-muted-foreground">Nothing entered here is written to disk.</p>
@@ -709,7 +745,52 @@ function UnlockPlan({
   );
 }
 
-type BrowseLevel = { title: string; token: string; entry: ArchiveEntrySummary | null; entries: ArchiveEntrySummary[] };
+function LegacyTreePackProgress({ progress }: { progress: ArchiveUnlockProgress }) {
+  const counting = !progress.indexTotalKnown;
+  const noIndexes = progress.indexTotalKnown && progress.totalPackIndexes === 0;
+  const percent = counting
+    ? 0
+    : noIndexes
+      ? 100
+    : Math.min(100, Math.round(progress.indexedPackIndexes / progress.totalPackIndexes * 100));
+  const activeDownloads = Math.max(0, progress.packCacheMisses - progress.downloadedPacks);
+  return (
+    <div className="rounded-md border bg-muted/35 px-3 py-2.5 text-[11px] text-muted-foreground">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium text-foreground">Tree-pack indexes</span>
+        <span className="tabular-nums">
+          {counting ? "Counting…" : noIndexes ? "No indexes" : `${progress.indexedPackIndexes} / ${progress.totalPackIndexes}`}
+        </span>
+      </div>
+      <div
+        className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-label="Legacy tree-pack indexing progress"
+        aria-valuemin={0}
+        aria-valuemax={counting ? undefined : Math.max(1, progress.totalPackIndexes)}
+        aria-valuenow={counting ? undefined : noIndexes ? 1 : progress.indexedPackIndexes}
+      >
+        <div
+          className={cn("h-full rounded-full bg-primary transition-[width]", counting && "w-1/3 animate-pulse")}
+          style={counting ? undefined : { width: `${percent}%` }}
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-2 tabular-nums">
+        <span>{progress.packCacheMisses} cache {progress.packCacheMisses === 1 ? "miss" : "misses"}</span>
+        <span>· {activeDownloads} downloading</span>
+        <span>· {progress.downloadedPacks} downloaded</span>
+      </div>
+    </div>
+  );
+}
+
+type BrowseLevel = {
+  title: string;
+  token: string;
+  entry: ArchiveEntrySummary | null;
+  entries: ArchiveEntrySummary[];
+  relativePath: string;
+};
 
 function ArchiveBrowser({
   archive,
@@ -721,7 +802,7 @@ function ArchiveBrowser({
   archive: UnlockedArchive;
   selectedFolderId: string;
   onSelectFolder: (folderId: string) => void;
-  onRestore: (entry: ArchiveEntrySummary) => void;
+  onRestore: (target: ArchiveRestoreTarget) => void;
   onLocked: (sessionId: string) => void;
 }) {
   const availableFolders = archive.folders.filter(folder => folder.latestRecord !== null);
@@ -745,7 +826,7 @@ function ArchiveBrowser({
     setError(null);
     try {
       const entries = root.kind === "folder" ? await getArchiveChildren(archive.sessionId, root.token) : [root];
-      setLevels([{ title: root.name, token: root.token, entry: root, entries }]);
+      setLevels([{ title: root.name, token: root.token, entry: root, entries, relativePath: root.name }]);
     } catch (nextError) {
       setError(messageFor(nextError));
     } finally {
@@ -798,7 +879,13 @@ function ArchiveBrowser({
     setError(null);
     try {
       const entries = await getArchiveChildren(archive.sessionId, entry.token);
-      setLevels(previous => [...previous, { title: entry.name, token: entry.token, entry, entries }]);
+      setLevels(previous => [...previous, {
+        title: entry.name,
+        token: entry.token,
+        entry,
+        entries,
+        relativePath: archiveChildPath(previous.at(-1)?.relativePath ?? "", entry.name),
+      }]);
     } catch (nextError) {
       setError(messageFor(nextError));
     } finally {
@@ -823,7 +910,13 @@ function ArchiveBrowser({
         suppressNextRoot.current = result.folderId;
         onSelectFolder(result.folderId);
       }
-      setLevels([{ title: result.parentPath, token: result.parentToken, entry: null, entries }]);
+      setLevels([{
+        title: result.parentPath,
+        token: result.parentToken,
+        entry: null,
+        entries,
+        relativePath: result.parentPath,
+      }]);
       setSearchQuery("");
     } catch (nextError) {
       setSearchError(messageFor(nextError));
@@ -869,7 +962,11 @@ function ArchiveBrowser({
             </select>
           ) : null}
           {current?.entry ? (
-            <Button variant="outline" size="sm" onClick={() => onRestore(current.entry!)}><Download /> Restore folder</Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onRestore({ entry: current.entry!, relativePath: current.relativePath })}
+            ><Download /> Restore folder</Button>
           ) : null}
           <Button variant="outline" size="sm" onClick={() => void lock()}><LockKeyhole /> Lock</Button>
         </div>
@@ -881,7 +978,7 @@ function ArchiveBrowser({
           query={searchQuery}
           response={searchResponse}
           onOpen={result => void openSearchResult(result)}
-          onRestore={onRestore}
+          onRestore={result => onRestore({ entry: result, relativePath: result.path })}
         />
       ) : null}
       {loading && !current ? <CenteredLoading label="Decrypting folder tree…" /> : null}
@@ -918,7 +1015,10 @@ function ArchiveBrowser({
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={event => { event.stopPropagation(); onRestore(entry); }}
+                      onClick={event => {
+                        event.stopPropagation();
+                        onRestore({ entry, relativePath: archiveEntryPath(current, entry) });
+                      }}
                       aria-label={`Queue Restore for ${entry.name}`}
                     ><Download /> Queue</Button>
                   </td>
@@ -932,6 +1032,16 @@ function ArchiveBrowser({
       ) : null}
     </section>
   );
+}
+
+function archiveChildPath(parentPath: string, name: string): string {
+  return parentPath ? `${parentPath}/${name}` : name;
+}
+
+function archiveEntryPath(level: BrowseLevel, entry: ArchiveEntrySummary): string {
+  return level.entry?.token === entry.token
+    ? level.relativePath
+    : archiveChildPath(level.relativePath, entry.name);
 }
 
 function ArchiveSearchResults({
@@ -1099,7 +1209,7 @@ function QueuePanel({
             />
             <Button variant="outline" size="sm" onClick={onChoose}><FolderOpen /> Choose…</Button>
           </div>
-          <p className="text-[10px] leading-4 text-muted-foreground">Matching size + timestamp files are skipped. Mismatches are atomically overwritten.</p>
+          <p className="text-[10px] leading-4 text-muted-foreground">The backup folder hierarchy is recreated here. Matching size + timestamp files are skipped; mismatches are atomically overwritten.</p>
         </div>
         {error ? <div className="border-b bg-destructive/10 px-4 py-3 text-xs leading-5 text-destructive">{error}</div> : null}
         {queue.jobs.length === 0 ? (
@@ -1159,7 +1269,7 @@ function QueuePanel({
             value={queue.concurrency}
             onChange={event => onConcurrency(Number(event.target.value))}
           >
-            {[1, 2, 3, 4].map(value => <option key={value} value={value}>{value}</option>)}
+            {Array.from({ length: 32 }, (_, index) => index + 1).map(value => <option key={value} value={value}>{value}</option>)}
           </select>
         </div>
       </aside>

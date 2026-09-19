@@ -1,6 +1,7 @@
-import type { ApiErrorPayload, CloudBucket } from "../shared/contracts";
+import type { ApiErrorPayload, ArchiveUnlockProgress, CloudBucket } from "../shared/contracts";
 import { unlockArq5KeySet } from "./archive/arq5/crypto";
 import { Arq5Repository } from "./archive/arq5/repository";
+import { Arq6Repository } from "./archive/arq6/repository";
 import { unlockArq7KeySet } from "./archive/arq7/crypto";
 import { Arq7Repository } from "./archive/arq7/repository";
 import type { ArchiveSessionStore } from "./archive/arq7/session-store";
@@ -63,16 +64,26 @@ export async function unlockArchive(
     const bucket = (await provider.listBuckets()).find(candidate => candidate.id === bucketId);
     if (!bucket) return json({ error: { code: "missing_bucket", message: "Bucket not found." } }, { status: 404 });
 
-    const repository = format === "arq7"
-      ? new Arq7Repository(
+    if (format === "arq5") {
+      let publishProgress: (progress: ArchiveUnlockProgress) => void = () => undefined;
+      const repository = await openArq5Repository(
+        provider,
+        bucket,
+        planId,
+        password,
+        progress => publishProgress(progress),
+      );
+      return streamArq5Unlock(repository, sessions, listener => publishProgress = listener);
+    }
+
+    const repository = format === "arq6" || format === "arq7"
+      ? new (format === "arq6" ? Arq6Repository : Arq7Repository)(
           provider,
           bucket,
           planId,
           await unlockArq7KeySet(await provider.readObject(bucket, `${planId}/encryptedkeyset.dat`), password),
         )
-      : format === "arq5"
-        ? await openArq5Repository(provider, bucket, planId, password)
-        : null;
+      : null;
     if (!repository) {
       return json({ error: { code: "unsupported_archive", message: "This archive format is not browsable yet." } }, { status: 422 });
     }
@@ -168,6 +179,7 @@ export async function enqueueRestore(queue: RestoreQueue, request: Request): Pro
       requiredString(body, "sessionId"),
       requiredString(body, "token"),
       requiredString(body, "destinationDirectory"),
+      requiredString(body, "relativePath"),
     );
     return json({ job }, { status: 202 });
   } catch (error) {
@@ -202,6 +214,7 @@ async function openArq5Repository(
   bucket: CloudBucket,
   computerId: string,
   password: string,
+  onUnlockProgress?: (progress: ArchiveUnlockProgress) => void,
 ): Promise<Arq5Repository> {
   let version: 2 | 3 = 3;
   let encrypted: Uint8Array;
@@ -213,7 +226,54 @@ async function openArq5Repository(
     encrypted = await provider.readObject(bucket, `${computerId}/encryptionv2.dat`);
   }
   const keySet = await unlockArq5KeySet(encrypted, password, version);
-  return new Arq5Repository(provider, bucket, computerId, keySet);
+  return new Arq5Repository(provider, bucket, computerId, keySet, onUnlockProgress);
+}
+
+function streamArq5Unlock(
+  repository: Arq5Repository,
+  sessions: ArchiveSessionStore,
+  attachProgress: (listener: (progress: ArchiveUnlockProgress) => void) => void,
+): Response {
+  const encoder = new TextEncoder();
+  let closed = false;
+  let sessionId: string | null = null;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (event: unknown) => {
+        if (!closed) controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      };
+      attachProgress(progress => send({ type: "progress", progress }));
+      void (async () => {
+        try {
+          const folders = await repository.listBackupFolders();
+          sessionId = sessions.add(repository, folders);
+          send({ type: "complete", archive: { sessionId, folders } });
+        } catch (error) {
+          if (sessionId) sessions.remove(sessionId);
+          else repository.destroy();
+          const response = apiError(error);
+          const payload = await response.json() as ApiErrorPayload;
+          send({ type: "error", status: response.status, error: payload.error });
+        } finally {
+          if (!closed) {
+            closed = true;
+            controller.close();
+          }
+        }
+      })();
+    },
+    cancel() {
+      closed = true;
+      if (sessionId) sessions.remove(sessionId);
+      else repository.destroy();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      ...privateHeaders,
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+    },
+  });
 }
 
 export function assertSameOrigin(request: Request): Response | null {
