@@ -26,27 +26,34 @@ export type Arq7Node = {
 };
 
 export type Arq7BackupRecord = {
+  version: number;
   backupFolderUUID: string;
   backupPlanUUID: string;
   creationDate: number;
   isComplete: boolean;
   localPath: string;
   volumeName: string | null;
-  nodeTreeVersion: number;
-  node: Arq7Node;
+  isImportedFromArq5: boolean;
+  node: Arq7Node | null;
 };
 
 export function parseBackupRecord(bytes: Uint8Array): Arq7BackupRecord {
   const value = parseJsonObject(bytes, "backup record");
+  const nodeValue = value.node;
+  const isImportedFromArq5 = nodeValue == null && value.arq5TreeBlobKey != null;
+  if (nodeValue == null && !isImportedFromArq5) {
+    throw formatError("backup record must contain either a native node or an Arq 5 tree blob key");
+  }
   return {
+    version: optionalSafeInteger(value, "version", 0),
     backupFolderUUID: requiredString(value, "backupFolderUUID"),
     backupPlanUUID: requiredString(value, "backupPlanUUID"),
-    creationDate: requiredSafeInteger(value, "creationDate"),
+    creationDate: requiredFiniteNumber(value, "creationDate"),
     isComplete: requiredBoolean(value, "isComplete"),
     localPath: requiredString(value, "localPath"),
     volumeName: optionalString(value, "volumeName"),
-    nodeTreeVersion: requiredInteger(value, "nodeTreeVersion"),
-    node: parseNode(requiredObject(value, "node")),
+    isImportedFromArq5,
+    node: nodeValue == null ? null : parseNode(asObject(nodeValue, "node")),
   };
 }
 
@@ -61,7 +68,7 @@ export function parseNode(value: Record<string, unknown>): Arq7Node {
     dataBlobLocs,
     itemSize: requiredSafeInteger(value, "itemSize"),
     containedFilesCount: requiredSafeInteger(value, "containedFilesCount"),
-    modificationTimeSeconds: requiredSafeInteger(value, "modificationTime_sec"),
+    modificationTimeSeconds: requiredSignedSafeInteger(value, "modificationTime_sec"),
     modificationTimeNanoseconds: requiredSafeInteger(value, "modificationTime_nsec"),
     mode: requiredSafeInteger(value, "mac_st_mode"),
     deleted: optionalBoolean(value, "deleted", false),
@@ -78,8 +85,8 @@ export function parseBlobLocation(value: Record<string, unknown>): Arq7BlobLocat
   return {
     blobIdentifier: requiredString(value, "blobIdentifier"),
     isPacked: requiredBoolean(value, "isPacked"),
-    isLargePack: requiredBoolean(value, "isLargePack"),
-    relativePath: requiredString(value, "relativePath"),
+    isLargePack: optionalBoolean(value, "isLargePack", false),
+    relativePath: optionalString(value, "relativePath") ?? "",
     offset: requiredSafeInteger(value, "offset"),
     length: requiredSafeInteger(value, "length"),
     stretchEncryptionKey: requiredBoolean(value, "stretchEncryptionKey"),
@@ -157,6 +164,22 @@ function requiredSafeInteger(value: Record<string, unknown>, key: string): numbe
   const candidate = value[key];
   if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 0) {
     throw formatError(`${key} must be a non-negative safe integer`);
+  }
+  return candidate;
+}
+
+function requiredSignedSafeInteger(value: Record<string, unknown>, key: string): number {
+  const candidate = value[key];
+  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate)) {
+    throw formatError(`${key} must be a signed safe integer`);
+  }
+  return candidate;
+}
+
+function requiredFiniteNumber(value: Record<string, unknown>, key: string): number {
+  const candidate = value[key];
+  if (typeof candidate !== "number" || !Number.isFinite(candidate)) {
+    throw formatError(`${key} must be a finite number`);
   }
   return candidate;
 }

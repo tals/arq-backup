@@ -95,6 +95,8 @@ export async function unlockArq7KeySet(encrypted: Uint8Array, password: string):
 }
 
 export function decryptArq7Object(encrypted: Uint8Array, keySet: Arq7KeySet): Uint8Array {
+  // Arq's per-location `stretchEncryptionKey` flag belongs to encryption
+  // version 1. Version 3 keysets use authenticated ARQO objects and ignore it.
   return decryptLegacyObject(encrypted, keySet);
 }
 

@@ -21,14 +21,16 @@ describe("encrypted Arq 5 tree-pack disk cache", () => {
     const { bytes, id } = makePack();
     const objectName = `${prefix}${id}.pack`;
     const provider = new FakeProvider(new Map([[objectName, bytes]]));
+    const events: string[] = [];
 
-    const first = new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot);
+    const first = new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot, event => events.push(event));
     expect(await first.readPackRange(objectName, 0, 7)).toEqual(bytes.subarray(0, 8));
     first.destroy();
 
-    const second = new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot);
+    const second = new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot, event => events.push(event));
     expect(await second.readPackRange(objectName, 4, 15)).toEqual(bytes.subarray(4, 16));
     expect(provider.reads).toEqual([objectName]);
+    expect(events).toEqual(["pack_cache_miss", "pack_downloaded"]);
 
     const cachePath = scopedPath(cacheRoot, id, "pack");
     expect(await readFile(cachePath)).toEqual(Buffer.from(bytes));
@@ -86,20 +88,16 @@ describe("encrypted Arq 5 tree-pack disk cache", () => {
     expect(provider.reads).toHaveLength(2);
   });
 
-  test("persists raw indexes only after their caller-supplied integrity check passes", async () => {
+  test("reads raw indexes without persisting them", async () => {
     const cacheRoot = await temporaryDirectory();
     const id = "a".repeat(40);
     const objectName = `${prefix}${id}.index`;
     const indexBytes = Buffer.from("raw-index-checksum-ok");
     const provider = new FakeProvider(new Map([[objectName, indexBytes]]));
-    const validate = (candidate: Uint8Array) => {
-      if (!Buffer.from(candidate).equals(indexBytes)) throw new Error("bad index");
-    };
-
-    await new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot).readIndex(objectName, validate);
-    await new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot).readIndex(objectName, validate);
-    expect(provider.reads).toEqual([objectName]);
-    expect(await readFile(scopedPath(cacheRoot, id, "index"))).toEqual(indexBytes);
+    expect(await new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot).readIndex(objectName)).toEqual(indexBytes);
+    expect(await new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot).readIndex(objectName)).toEqual(indexBytes);
+    expect(provider.reads).toEqual([objectName, objectName]);
+    await expect(readFile(scopedPath(cacheRoot, id, "index"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

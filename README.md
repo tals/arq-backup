@@ -27,4 +27,5 @@ sudo bun run import:arq
 | Version | Read | Write |
 | --- | :---: | :---: |
 | Arq 5 | Yes | No |
+| Arq 6 | Experimental | No |
 | Arq 7 | Yes | No |

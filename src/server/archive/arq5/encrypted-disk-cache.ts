@@ -13,9 +13,9 @@ const PACK_VERSION = 2;
 const CACHE_DIRECTORY_MODE = 0o700;
 const CACHE_FILE_MODE = 0o600;
 
-type CacheKind = "index" | "pack";
 type Validator = (bytes: Uint8Array) => void;
 type FileIdentity = { device: number; inode: number; size: number; modified: number; changed: number };
+export type Arq5EncryptedDiskCacheEvent = "pack_cache_miss" | "pack_downloaded";
 
 /**
  * Durable cache for the original encrypted bytes from an Arq 5 tree packset.
@@ -31,6 +31,7 @@ export class Arq5EncryptedDiskCache {
     readonly bucket: CloudBucket,
     readonly prefix: string,
     cacheRoot: string,
+    readonly onProgress?: (event: Arq5EncryptedDiskCacheEvent) => void,
   ) {
     const scope = createHash("sha256")
       .update(`${provider.connectionId}\0${bucket.id}\0${prefix}`)
@@ -38,16 +39,17 @@ export class Arq5EncryptedDiskCache {
     this.#scopeDirectory = join(cacheRoot, scope);
   }
 
-  async readIndex(objectName: string, validator: Validator): Promise<Uint8Array> {
-    const cachePath = this.#cachePath(objectName, "index");
-    return this.#readOrFetch(cachePath, objectName, validator);
+  async readIndex(objectName: string): Promise<Uint8Array> {
+    // Pack indexes are not encrypted object data. Keep them out of the
+    // durable cache. The pack set validates and parses each fresh read once.
+    return this.provider.readObject(this.bucket, objectName);
   }
 
   async readPackRange(objectName: string, start: number, endInclusive: number): Promise<Uint8Array> {
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(endInclusive) || start < 0 || endInclusive < start) {
       throw new ArchiveFormatError("invalid_pack_index", "An Arq 5 packed-object range is invalid");
     }
-    const cachePath = this.#cachePath(objectName, "pack");
+    const cachePath = this.#cachePath(objectName);
 
     const identity = this.#validated.get(cachePath);
     if (identity) {
@@ -109,20 +111,22 @@ export class Arq5EncryptedDiskCache {
       }
     }
 
+    this.onProgress?.("pack_cache_miss");
     const remote = await this.provider.readObject(this.bucket, objectName);
     validator(remote);
     await atomicWrite(cachePath, remote);
     this.#validated.set(cachePath, identityFor(await stat(cachePath)));
+    this.onProgress?.("pack_downloaded");
     return remote;
   }
 
-  #cachePath(objectName: string, kind: CacheKind): string {
+  #cachePath(objectName: string): string {
     const filename = basename(objectName);
-    const match = /^([a-fA-F0-9]{40})\.(index|pack)$/.exec(filename);
-    if (!match || match[2] !== kind) {
-      throw new ArchiveFormatError("invalid_pack_name", `Arq 5 ${kind} object has an invalid content-addressed name`);
+    const match = /^([a-fA-F0-9]{40})\.pack$/.exec(filename);
+    if (!match) {
+      throw new ArchiveFormatError("invalid_pack_name", "An Arq 5 pack object has an invalid content-addressed name");
     }
-    return join(this.#scopeDirectory, `${match[1]!.toLowerCase()}.${kind}`);
+    return join(this.#scopeDirectory, `${match[1]!.toLowerCase()}.pack`);
   }
 }
 

@@ -33,20 +33,23 @@ export async function probeArchive(
   }
 
   const rootNames = root.objects.map(object => object.name);
-  const [arq7Plans, legacyComputers] = await Promise.all([
-    listArq7Plans(provider, bucket, rootNames),
+  const [modernPlans, legacyComputers] = await Promise.all([
+    listModernPlans(provider, bucket, rootNames),
     listLegacyComputers(provider, bucket, rootNames),
   ]);
-  const plans = [...arq7Plans, ...legacyComputers];
+  const plans = [...modernPlans, ...legacyComputers];
   if (plans.length > 0) {
+    const formats = new Set(plans.map(plan => plan.format));
+    const format: ArchiveProbe["format"] = formats.size === 1 ? plans[0]!.format : "mixed";
+    const hasArq6 = formats.has("arq6");
     return {
       state: "locked",
-      format: arq7Plans.length > 0 && legacyComputers.length > 0
-        ? "mixed"
-        : arq7Plans.length > 0 ? "arq7" : "arq5",
-      message: legacyComputers.length > 0
-        ? "Current Arq 7 plans and older computer backups were found in this bucket."
-        : "Enter the Arq Encryption Password to open these backup plans.",
+      format,
+      message: hasArq6
+        ? "Arq 6 backup plans were found. Arq 6 browsing and restore support is experimental."
+        : legacyComputers.length > 0 && modernPlans.length > 0
+          ? "Current Arq 7 plans and older computer backups were found in this bucket."
+          : "Enter the Arq Encryption Password to open these backup plans.",
       plans: plans.sort((left, right) => left.name.localeCompare(right.name)),
     };
   }
@@ -71,7 +74,7 @@ async function listLegacyPlans(
     .map(id => ({ id, name: id, locked: true, format: "arq-legacy" as const }));
 }
 
-async function listArq7Plans(
+async function listModernPlans(
   provider: CloudStorageProvider,
   bucket: CloudBucket,
   rootNames: string[],
@@ -86,6 +89,7 @@ async function listArq7Plans(
     const page = await provider.listObjects(bucket, { prefix, delimiter: "/", limit: 100 });
     const names = new Set(page.objects.map(object => object.name));
     if (!names.has(`${prefix}backupconfig.json`) || !names.has(`${prefix}encryptedkeyset.dat`)) return null;
+    const format = names.has(`${prefix}snapshots/`) && !names.has(`${prefix}backupfolders/`) ? "arq6" : "arq7";
 
     let name = id;
     try {
@@ -94,7 +98,7 @@ async function listArq7Plans(
     } catch {
       // The structural markers are sufficient. Unlocking will surface corrupt config precisely.
     }
-    return { id, name, locked: true, format: "arq7" } satisfies BackupPlanSummary;
+    return { id, name, locked: true, format } satisfies BackupPlanSummary;
   }));
   return plans.filter((plan): plan is NonNullable<typeof plan> => plan !== null)
     .sort((left, right) => left.name.localeCompare(right.name));

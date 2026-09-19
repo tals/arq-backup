@@ -11,11 +11,20 @@ const INDEX_ENTRY_LENGTH = 40;
 const SHA1_LENGTH = 20;
 const INDEX_MAGIC = 0xff744f63;
 const PACK_RECORD_OVERHEAD = 10;
-const INDEX_CONCURRENCY = 4;
+export const ARQ5_INDEX_CONCURRENCY = 16;
+
+export type Arq5IndexScheduler = <T>(action: () => Promise<T>) => Promise<T>;
+
+export type Arq5PackSetProgressEvent =
+  | { type: "indexes_discovered"; count: number }
+  | { type: "index_indexed" }
+  | { type: "pack_cache_miss" }
+  | { type: "pack_downloaded" };
 
 export type PackLocation = {
   packObjectName: string;
   offset: number;
+  legacyCorrectedOffset: number;
   dataLength: number;
 };
 
@@ -45,7 +54,11 @@ export function parseArq5PackIndex(bytes: Uint8Array, packObjectName: string): M
     const sha1 = Buffer.from(reader.readBytes(SHA1_LENGTH)).toString("hex");
     reader.readBytes(4);
     if (dataLength <= 0) throw new ArchiveFormatError("invalid_pack_index", "An Arq 5 pack index contains an empty object");
-    locations.set(sha1, { packObjectName, offset, dataLength });
+    const legacyCorrectedOffset = offset + index * PACK_RECORD_OVERHEAD;
+    if (!Number.isSafeInteger(legacyCorrectedOffset)) {
+      throw new ArchiveFormatError("invalid_pack_index", "An Arq 5 corrected legacy pack offset is too large");
+    }
+    locations.set(sha1, { packObjectName, offset, legacyCorrectedOffset, dataLength });
   }
   return locations;
 }
@@ -53,6 +66,7 @@ export function parseArq5PackIndex(bytes: Uint8Array, packObjectName: string): M
 export class Arq5PackSet {
   readonly #locations = new Map<string, PackLocation>();
   readonly #cache: Arq5EncryptedDiskCache | null;
+  #indexFilesPromise: Promise<CloudObject[]> | null = null;
   #preparePromise: Promise<void> | null = null;
 
   constructor(
@@ -61,8 +75,12 @@ export class Arq5PackSet {
     readonly prefix: string,
     cacheRoot: string | null = appConfig.legacyTreePackCachePath,
     readonly requireArqo = true,
+    readonly onProgress?: (event: Arq5PackSetProgressEvent) => void,
+    readonly scheduleIndexRead: Arq5IndexScheduler = action => action(),
   ) {
-    this.#cache = cacheRoot === null ? null : new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot);
+    this.#cache = cacheRoot === null
+      ? null
+      : new Arq5EncryptedDiskCache(provider, bucket, prefix, cacheRoot, event => this.onProgress?.({ type: event }));
   }
 
   prepare(): Promise<void> {
@@ -70,20 +88,42 @@ export class Arq5PackSet {
     return this.#preparePromise;
   }
 
+  async discoverIndexes(): Promise<void> {
+    await this.#indexFiles();
+  }
+
   async readObject(sha1: string): Promise<Uint8Array> {
     await this.prepare();
     const location = this.#locations.get(sha1.toLowerCase());
     if (!location) throw new ArchiveFormatError("missing_packed_object", `Arq 5 object ${sha1} was not found in its tree packset`);
-    const endInclusive = location.offset + location.dataLength + PACK_RECORD_OVERHEAD - 1;
+    const offsets = location.legacyCorrectedOffset === location.offset
+      ? [location.offset]
+      : [location.offset, location.legacyCorrectedOffset];
+    let lastFormatError: ArchiveFormatError | null = null;
+    for (const offset of offsets) {
+      try {
+        return await this.#readObjectAt(location, offset);
+      } catch (error) {
+        if (!(error instanceof ArchiveFormatError)) throw error;
+        lastFormatError = error;
+      }
+    }
+    throw lastFormatError ?? new ArchiveFormatError("invalid_pack_record", "An Arq 5 packed object could not be read");
+  }
+
+  async #readObjectAt(location: PackLocation, offset: number): Promise<Uint8Array> {
+    const endInclusive = offset + location.dataLength + PACK_RECORD_OVERHEAD - 1;
     if (!Number.isSafeInteger(endInclusive)) throw new ArchiveFormatError("invalid_pack_index", "An Arq 5 packed-object range is too large");
-    let range = await this.#readRange(location.packObjectName, location.offset, endInclusive);
-    if (this.requireArqo && startsWithArqo(range)) return Uint8Array.from(range.subarray(0, location.dataLength));
+    let range = await this.#readRange(location.packObjectName, offset, endInclusive);
+    // Arq indexes regenerated through 4.5.3 can point directly at the object
+    // bytes instead of the 10-byte pack record, for both tree and blob packs.
+    if (startsWithArqo(range)) return Uint8Array.from(range.subarray(0, location.dataLength));
     try {
       return extractPackRecord(range, location.dataLength, this.requireArqo);
     } catch (error) {
       if (!(error instanceof ArchiveFormatError) || error.code !== "unexpected_end_of_data") throw error;
-      const expandedEnd = location.offset + location.dataLength + 65_536 - 1;
-      range = await this.#readRange(location.packObjectName, location.offset, expandedEnd);
+      const expandedEnd = offset + location.dataLength + 65_536 - 1;
+      range = await this.#readRange(location.packObjectName, offset, expandedEnd);
       return extractPackRecord(range, location.dataLength, this.requireArqo);
     }
   }
@@ -94,19 +134,29 @@ export class Arq5PackSet {
   }
 
   async #loadIndexes(): Promise<void> {
-    const indexes = await listAll(this.provider, this.bucket, this.prefix);
-    const files = indexes.filter(object => object.kind === "file" && object.name.endsWith(".index"));
-    await mapConcurrent(files, INDEX_CONCURRENCY, async object => {
+    const files = await this.#indexFiles();
+    await mapConcurrent(files, ARQ5_INDEX_CONCURRENCY, async object => {
       const packObjectName = `${object.name.slice(0, -".index".length)}.pack`;
-      const bytes = this.#cache
-        ? await this.#cache.readIndex(object.name, candidate => {
-            parseArq5PackIndex(candidate, packObjectName);
-          })
-        : await this.provider.readObject(this.bucket, object.name);
+      const bytes = await this.scheduleIndexRead(() => this.#cache
+        ? this.#cache.readIndex(object.name)
+        : this.provider.readObject(this.bucket, object.name));
       for (const [sha1, location] of parseArq5PackIndex(bytes, packObjectName)) {
         this.#locations.set(sha1, location);
       }
+      this.onProgress?.({ type: "index_indexed" });
     });
+  }
+
+  #indexFiles(): Promise<CloudObject[]> {
+    this.#indexFilesPromise ??= this.#discoverIndexFiles();
+    return this.#indexFilesPromise;
+  }
+
+  async #discoverIndexFiles(): Promise<CloudObject[]> {
+    const indexes = await listAll(this.provider, this.bucket, this.prefix);
+    const files = indexes.filter(object => object.kind === "file" && object.name.endsWith(".index"));
+    this.onProgress?.({ type: "indexes_discovered", count: files.length });
+    return files;
   }
 
   #readRange(objectName: string, start: number, endInclusive: number): Promise<Uint8Array> {

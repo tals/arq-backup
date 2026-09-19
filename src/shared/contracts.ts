@@ -19,7 +19,7 @@ export type AppStatus = {
 
 export type ArchiveProbe = {
   state: "supported" | "empty" | "unsupported" | "locked";
-  format: "arq-legacy" | "arq5" | "arq7" | "mixed" | null;
+  format: "arq-legacy" | "arq5" | "arq6" | "arq7" | "mixed" | null;
   message: string;
   plans: BackupPlanSummary[];
 };
@@ -28,7 +28,7 @@ export type BackupPlanSummary = {
   id: string;
   name: string;
   locked: boolean;
-  format: "arq-legacy" | "arq5" | "arq7";
+  format: "arq-legacy" | "arq5" | "arq6" | "arq7";
   recordCount?: number;
 };
 
@@ -59,6 +59,15 @@ export type BackupFolderSummary = {
 export type UnlockedArchive = {
   sessionId: string;
   folders: BackupFolderSummary[];
+};
+
+export type ArchiveUnlockProgress = {
+  phase: "indexing_legacy_tree_packs";
+  indexTotalKnown: boolean;
+  indexedPackIndexes: number;
+  totalPackIndexes: number;
+  packCacheMisses: number;
+  downloadedPacks: number;
 };
 
 export type ArchiveSearchResult = ArchiveEntrySummary & {

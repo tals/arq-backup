@@ -86,6 +86,9 @@ export async function unlockArq5KeySet(
 }
 
 export function decryptArq5Object(encrypted: Uint8Array, keySet: Arq5KeySet): Uint8Array {
+  // The archived per-blob `stretched` bit selects between ObjectEncryptorV1
+  // password derivations only. Arq keyset versions 2 and 3 use authenticated
+  // ARQO objects, whose decryption is independent of that historical bit.
   return decryptLegacyObject(encrypted, keySet);
 }
 
