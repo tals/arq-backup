@@ -137,20 +137,27 @@ export class B2Provider implements CloudStorageProvider {
     options: ReadObjectOptions = {},
   ): Promise<Uint8Array> {
     this.#assertBucket(bucket);
-    const auth = await this.#authorize();
     const encodedName = objectName.split("/").map(encodeURIComponent).join("/");
-    const headers = new Headers({ Authorization: auth.authorizationToken });
-    if (options.range) {
-      const end = options.range.endInclusive === undefined ? "" : String(options.range.endInclusive);
-      headers.set("Range", `bytes=${options.range.start}-${end}`);
-    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const auth = await this.#authorize();
+      const headers = new Headers({ Authorization: auth.authorizationToken });
+      if (options.range) {
+        const end = options.range.endInclusive === undefined ? "" : String(options.range.endInclusive);
+        headers.set("Range", `bytes=${options.range.start}-${end}`);
+      }
 
-    const response = await this.#fetch(`${auth.downloadUrl}/file/${encodeURIComponent(bucket.name)}/${encodedName}`, {
-      headers,
-      signal: options.signal,
-    });
-    if (!response.ok) await this.#throwResponseError(response);
-    return new Uint8Array(await response.arrayBuffer());
+      const response = await this.#fetch(`${auth.downloadUrl}/file/${encodeURIComponent(bucket.name)}/${encodedName}`, {
+        headers,
+        signal: options.signal,
+      });
+      if (response.ok) return new Uint8Array(await response.arrayBuffer());
+      if (response.status === 401) {
+        if (this.#authorization === auth) this.#authorization = null;
+        if (attempt === 0) continue;
+      }
+      await this.#throwResponseError(response);
+    }
+    throw new CloudProviderError("download_retry_exhausted", "B2 download authorization retry was exhausted", 401);
   }
 
   async #authorize(): Promise<B2Authorization> {

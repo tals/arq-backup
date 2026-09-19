@@ -87,6 +87,47 @@ describe("B2 provider", () => {
     expect(listRequest.url.includes("?")).toBe(false);
     expect(await listRequest.json()).toMatchObject({ prefix, startFileName: `${prefix}next.index` });
   });
+
+  test("reauthorizes once when a B2 download token expires", async () => {
+    const requests: Request[] = [];
+    let authorizations = 0;
+    const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (request.url === "https://auth.test/authorize") {
+        authorizations += 1;
+        return Response.json({
+          accountId: "account-1",
+          apiInfo: {
+            storageApi: {
+              apiUrl: "https://api.test",
+              downloadUrl: "https://download.test",
+              authorizationToken: `auth-token-${authorizations}`,
+              allowed: {
+                capabilities: ["listFiles", "readFiles"],
+                bucketId: "bucket-1",
+                bucketName: "archive",
+                namePrefix: null,
+              },
+            },
+          },
+        });
+      }
+      if (request.url.startsWith("https://download.test/file/")) {
+        if (request.headers.get("authorization") === "auth-token-1") {
+          return Response.json({ code: "expired_auth_token", message: "expired", status: 401 }, { status: 401 });
+        }
+        return new Response("payload");
+      }
+      return Response.json({ code: "unexpected", message: "Unexpected mock request", status: 500 }, { status: 500 });
+    }) as typeof globalThis.fetch;
+    const provider = new B2Provider(credential, { fetch: mockFetch, authorizeUrl: "https://auth.test/authorize" });
+    const bucket = (await provider.listBuckets())[0]!;
+
+    expect(new TextDecoder().decode(await provider.readObject(bucket, "object"))).toBe("payload");
+    expect(authorizations).toBe(2);
+    expect(requests.filter(request => request.url.startsWith("https://download.test/file/"))).toHaveLength(2);
+  });
 });
 
 function mockB2Fetch(
