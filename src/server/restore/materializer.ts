@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, lutimes, mkdir, open, readlink, rename, symlink, utimes } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { chmodSync, lstatSync, mkdirSync, renameSync } from "node:fs";
+import { lstat, lutimes, open, readlink, symlink, utimes } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { RestoreItemDescriptor, RestoreSource } from "./source";
 
 const DEFAULT_FILE_PERMISSIONS = 0o644;
@@ -16,22 +17,69 @@ export class RestoreCanceledError extends Error {
 export type MaterializeCallbacks = {
   canceled(): boolean;
   onBytes(bytes: number): void;
+  beforeCommit?(): void;
 };
 
 export type MaterializeResult = { skipped: boolean };
 
-export async function ensureRestoreDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const value = await lstat(path);
+export type RestoreDirectoryPreparation = { previousMode: number | null };
+
+export function chmodModeSync(path: string, mode: number): void {
+  const restorableMode = mode & 0o7777;
+  if ((restorableMode & 0o7000) === 0) {
+    chmodSync(path, restorableMode);
+    return;
+  }
+
+  // Bun's node:fs chmod compatibility currently drops special mode bits on
+  // macOS. Use the native utility only when those bits must be preserved.
+  const result = Bun.spawnSync({
+    cmd: ["/bin/chmod", restorableMode.toString(8).padStart(4, "0"), path],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.success) return;
+  const detail = new TextDecoder().decode(result.stderr).trim();
+  throw new Error(`Failed to apply mode ${restorableMode.toString(8)} to ${path}: ${detail || `chmod exited ${result.exitCode}`}`);
+}
+
+function lchmodModeSync(path: string, mode: number): void {
+  const restorableMode = mode & 0o7777;
+  const result = Bun.spawnSync({
+    cmd: ["/bin/chmod", "-h", restorableMode.toString(8).padStart(4, "0"), path],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.success) return;
+  const detail = new TextDecoder().decode(result.stderr).trim();
+  throw new Error(`Failed to apply symlink mode ${restorableMode.toString(8)} to ${path}: ${detail || `chmod exited ${result.exitCode}`}`);
+}
+
+export function ensureRestoreDirectory(
+  path: string,
+  temporarilyWritable = false,
+): RestoreDirectoryPreparation {
+  let previousMode: number | null = null;
+  try {
+    const previous = lstatSync(path);
+    if (!previous.isDirectory()) throw new Error(`Restore path is not a directory: ${path}`);
+    previousMode = previous.mode & 0o7777;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const value = lstatSync(path);
   if (!value.isDirectory()) throw new Error(`Restore path is not a directory: ${path}`);
+  if (temporarilyWritable) chmodModeSync(path, (value.mode & 0o7777) | 0o700);
+  return { previousMode };
 }
 
 export async function finalizeRestoreDirectory(path: string, item: RestoreItemDescriptor): Promise<void> {
   const value = await lstat(path);
   if (!value.isDirectory()) throw new Error(`Restore path changed from a directory: ${path}`);
-  await chmod(path, restorePermissions(item));
   const modified = modifiedTimeSeconds(item);
   await utimes(path, modified, modified);
+  chmodModeSync(path, restorePermissions(item));
 }
 
 export async function materializeRegularFile(
@@ -40,12 +88,21 @@ export async function materializeRegularFile(
   path: string,
   item: RestoreItemDescriptor,
   callbacks: MaterializeCallbacks,
+  requireExactSkip = false,
 ): Promise<MaterializeResult> {
   await ensureRestoreDirectory(dirname(path));
   const destination = await lstatIfExists(path);
   if (destination && !destination.isFile()) throw new Error(`File restore conflicts with a non-file destination: ${path}`);
-  if (destination && destination.size === item.entry.size && await sameModifiedTime(path, item)) {
-    await chmod(path, restorePermissions(item));
+  const exactDestination = destination
+    && destination.size === item.entry.size
+    && sameModifiedTime(path, item);
+  if (requireExactSkip && !exactDestination) {
+    throw new Error(`Restore destination changed after its exact size-and-timestamp skip was reserved: ${path}`);
+  }
+  if (exactDestination) {
+    if (callbacks.canceled()) throw new RestoreCanceledError();
+    callbacks.beforeCommit?.();
+    chmodModeSync(path, restorePermissions(item));
     callbacks.onBytes(item.entry.size);
     return { skipped: true };
   }
@@ -64,6 +121,7 @@ export async function materializeRegularFile(
   callbacks.onBytes(partial.size);
 
   const retainedSize = partial.size;
+  chmodModeSync(partialPath, (partial.mode & 0o7777) | 0o600);
   const output = await open(partialPath, "r+");
   let sourceOffset = 0;
   let wroteData = false;
@@ -116,11 +174,26 @@ export async function materializeRegularFile(
     throw new Error(`Partial File ended at ${completed.size} bytes, expected ${item.entry.size}: ${partialPath}`);
   }
   if (callbacks.canceled()) throw new RestoreCanceledError();
-  await chmod(partialPath, restorePermissions(item));
   const modified = modifiedTimeSeconds(item);
   await utimes(partialPath, modified, modified);
-  await rename(partialPath, path);
+  if (callbacks.canceled()) throw new RestoreCanceledError();
+  chmodModeSync(partialPath, restorePermissions(item));
+  if (callbacks.canceled()) throw new RestoreCanceledError();
+  callbacks.beforeCommit?.();
+  renameSync(partialPath, path);
   return { skipped: false };
+}
+
+export function regularFileMatchesDestination(path: string, item: RestoreItemDescriptor): boolean {
+  try {
+    const destination = lstatSync(path);
+    return destination.isFile()
+      && destination.size === item.entry.size
+      && sameModifiedTime(path, item);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function materializeSymlink(
@@ -153,10 +226,15 @@ export async function materializeSymlink(
     if (size !== item.entry.size) throw new Error(`Archived symlink data produced ${size} bytes, expected ${item.entry.size}: ${path}`);
     const target = Buffer.concat(chunks);
     try {
-      if (destination && await sameModifiedTime(path, item)) {
+      if (destination && sameModifiedTime(path, item)) {
         const existingTarget = await readlink(path, { encoding: "buffer" });
         try {
-          if (existingTarget.equals(target)) return { skipped: true };
+          if (existingTarget.equals(target)) {
+            if (callbacks.canceled()) throw new RestoreCanceledError();
+            callbacks.beforeCommit?.();
+            lchmodModeSync(path, restorePermissions(item));
+            return { skipped: true };
+          }
         } finally {
           existingTarget.fill(0);
         }
@@ -178,7 +256,11 @@ export async function materializeSymlink(
       if (callbacks.canceled()) throw new RestoreCanceledError();
       const modified = modifiedTimeSeconds(item);
       await lutimes(partialPath, modified, modified);
-      await rename(partialPath, path);
+      if (callbacks.canceled()) throw new RestoreCanceledError();
+      lchmodModeSync(partialPath, restorePermissions(item));
+      if (callbacks.canceled()) throw new RestoreCanceledError();
+      callbacks.beforeCommit?.();
+      renameSync(partialPath, path);
       return { skipped: false };
     } finally {
       target.fill(0);
@@ -189,14 +271,15 @@ export async function materializeSymlink(
 }
 
 export function partialFilePath(path: string, identity: string): string {
-  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 20);
-  return join(dirname(path), `.${basename(path)}.arq-restore-${digest}.partial`);
+  const digest = createHash("sha256").update(identity).update("\0").update(path).digest("hex");
+  return join(dirname(path), `.arq-restore-${digest}.partial`);
 }
 
 function restorePermissions(item: RestoreItemDescriptor): number {
-  const archived = item.entry.mode & 0o777;
-  if (archived !== 0) return archived;
-  return item.entry.kind === "folder" ? DEFAULT_DIRECTORY_PERMISSIONS : DEFAULT_FILE_PERMISSIONS;
+  if (item.entry.mode === 0) {
+    return item.entry.kind === "folder" ? DEFAULT_DIRECTORY_PERMISSIONS : DEFAULT_FILE_PERMISSIONS;
+  }
+  return item.entry.mode & 0o7777;
 }
 
 async function writeFully(
@@ -239,8 +322,8 @@ function modifiedTimeSeconds(item: RestoreItemDescriptor): number {
   return value;
 }
 
-async function sameModifiedTime(path: string, item: RestoreItemDescriptor): Promise<boolean> {
-  const actual = (await lstat(path, { bigint: true })).mtimeNs;
+function sameModifiedTime(path: string, item: RestoreItemDescriptor): boolean {
+  const actual = lstatSync(path, { bigint: true }).mtimeNs;
   const archived = BigInt(item.modifiedSeconds) * 1_000_000_000n + BigInt(item.modifiedNanoseconds);
   if (actual === archived) return true;
 

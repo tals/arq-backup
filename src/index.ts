@@ -62,17 +62,22 @@ console.log(`Arq Restore is running at ${server.url}`);
 console.log(`Credential database: ${appConfig.databasePath}`);
 
 if (import.meta.hot) {
-  import.meta.hot.dispose(() => {
-    restoreQueue.destroy();
+  import.meta.hot.dispose(async () => {
+    await restoreQueue.destroy();
     archiveSessions.destroy();
     credentials.close();
   });
 } else {
-  process.once("SIGINT", () => {
-    restoreQueue.destroy();
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await restoreQueue.destroy();
     archiveSessions.destroy();
     credentials.close();
-    server.stop();
+    await server.stop();
     process.exit(0);
-  });
+  };
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
 }

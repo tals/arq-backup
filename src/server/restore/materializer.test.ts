@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, lstat, lutimes, mkdtemp, readFile, readlink, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, lutimes, mkdir, mkdtemp, readFile, readlink, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ArchiveEntrySummary } from "../../shared/contracts";
 import {
+  ensureRestoreDirectory,
   finalizeRestoreDirectory,
   materializeRegularFile,
   materializeSymlink,
@@ -34,6 +35,41 @@ describe("Restore materializer", () => {
     expect((await lstat(path)).mode & 0o777).toBe(0o755);
   });
 
+  test("skips an exact-size/time hard-linked destination without reading archive data", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "restored.txt");
+    const otherLink = join(root, "other-link.txt");
+    const modified = new Date("2020-01-02T03:04:05.000Z");
+    await writeFile(path, "same");
+    await chmod(path, 0o600);
+    await utimes(path, modified, modified);
+    await link(path, otherLink);
+    const source = new FakeSource(Buffer.from("same"));
+    const item = descriptor("restored.txt", "file", 4, modified, 0o100755);
+
+    expect(await materializeRegularFile(source, "token", path, item, callbacks(() => undefined))).toEqual({ skipped: true });
+    expect(source.reads).toBe(0);
+    expect((await lstat(path)).nlink).toBe(2);
+    expect((await lstat(path)).mode & 0o777).toBe(0o755);
+    expect((await lstat(otherLink)).mode & 0o777).toBe(0o755);
+  });
+
+  test("does not chmod an exact-match file after cancellation", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "canceled-skip.txt");
+    const modified = new Date("2020-01-02T03:04:05.000Z");
+    await writeFile(path, "same");
+    await chmod(path, 0o600);
+    await utimes(path, modified, modified);
+    const item = descriptor("canceled-skip.txt", "file", 4, modified, 0o100755);
+
+    await expect(materializeRegularFile(new FakeSource(Buffer.from("same")), "token", path, item, {
+      canceled: () => true,
+      onBytes: () => undefined,
+    })).rejects.toThrow("Restore canceled");
+    expect((await lstat(path)).mode & 0o777).toBe(0o600);
+  });
+
   test("resumes a deterministic Partial File and atomically overwrites a mismatched file", async () => {
     const root = await temporaryDirectory();
     const path = join(root, "report.txt");
@@ -59,6 +95,39 @@ describe("Restore materializer", () => {
     expect(await materializeRegularFile(new FakeSource(Buffer.from("data")), "token", path, item, callbacks(() => undefined)))
       .toEqual({ skipped: false });
     expect((await lstat(path)).mode & 0o777).toBe(0o644);
+  });
+
+  test("restores a valid long filename through a bounded deterministic Partial File name", async () => {
+    const root = await temporaryDirectory();
+    const name = `${"a".repeat(220)}.txt`;
+    const path = join(root, name);
+    const item = descriptor(name, "file", 4, new Date(0), 0o100600, "long-name");
+    const partialPath = partialFilePath(path, item.identity);
+
+    expect(Buffer.byteLength(basename(partialPath))).toBeLessThanOrEqual(255);
+    expect(await materializeRegularFile(new FakeSource(Buffer.from("data")), "token", path, item, callbacks(() => undefined)))
+      .toEqual({ skipped: false });
+    expect(await readFile(path, "utf8")).toBe("data");
+  });
+
+  test("restores an explicitly archived file mode with no permission bits", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "mode-zero.txt");
+    const item = descriptor("mode-zero.txt", "file", 4, new Date(0), 0o100000);
+
+    expect(await materializeRegularFile(new FakeSource(Buffer.from("data")), "token", path, item, callbacks(() => undefined)))
+      .toEqual({ skipped: false });
+    expect((await lstat(path)).mode & 0o777).toBe(0);
+  });
+
+  test("restores archived special permission bits on a regular file", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "special-mode.txt");
+    const item = descriptor("special-mode.txt", "file", 4, new Date(0), 0o104755);
+
+    expect(await materializeRegularFile(new FakeSource(Buffer.from("data")), "token", path, item, callbacks(() => undefined)))
+      .toEqual({ skipped: false });
+    expect((await lstat(path)).mode & 0o7777).toBe(0o4755);
   });
 
   test("uses default file permissions when skipping a complete file with no archived permission bits", async () => {
@@ -91,6 +160,42 @@ describe("Restore materializer", () => {
     expect(source.reads).toBe(1);
     expect(await readFile(path, "utf8")).toBe("old");
     expect(await readFile(partialPath, "utf8")).toBe("data");
+  });
+
+  test("retains the Partial File when cancellation arrives at the final commit boundary", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "cancel-at-commit.txt");
+    const item = descriptor("cancel-at-commit.txt", "file", 0, new Date(0), 0o100600, "cancel-at-commit");
+    const partialPath = partialFilePath(path, item.identity);
+    await writeFile(path, "old");
+    let cancellationChecks = 0;
+
+    await expect(materializeRegularFile(new FakeSource(Buffer.alloc(0)), "token", path, item, {
+      canceled: () => ++cancellationChecks >= 2,
+      onBytes: () => undefined,
+    })).rejects.toThrow("Restore canceled");
+    expect(await readFile(path, "utf8")).toBe("old");
+    expect((await lstat(partialPath)).size).toBe(0);
+  });
+
+  test("resumes a retained Partial File after a read-only archived mode was applied at commit", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "readonly-retry.txt");
+    const item = descriptor("readonly-retry.txt", "file", 0, new Date(0), 0o100400, "readonly-retry");
+    const partialPath = partialFilePath(path, item.identity);
+
+    await expect(materializeRegularFile(new FakeSource(Buffer.alloc(0)), "token", path, item, {
+      canceled: () => false,
+      onBytes: () => undefined,
+      beforeCommit: () => {
+        throw new Error("injected pre-commit failure");
+      },
+    })).rejects.toThrow("injected pre-commit failure");
+    expect((await lstat(partialPath)).mode & 0o777).toBe(0o400);
+
+    expect(await materializeRegularFile(new FakeSource(Buffer.alloc(0)), "token", path, item, callbacks(() => undefined)))
+      .toEqual({ skipped: false });
+    expect((await lstat(path)).mode & 0o777).toBe(0o400);
   });
 
   test("hard-errors when retained Partial File bytes differ from the archive", async () => {
@@ -128,6 +233,22 @@ describe("Restore materializer", () => {
     expect(await materializeSymlink(new FakeSource(target), "token", path, item, callbacks(() => undefined))).toEqual({ skipped: false });
     expect(await readlink(path, { encoding: "buffer" })).toEqual(target);
     expect((await lstat(path)).isSymbolicLink()).toBe(true);
+    expect((await lstat(path)).mode & 0o777).toBe(0o777);
+  });
+
+  test("restores symlink mode when skipping an exact target and timestamp", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "link");
+    const target = Buffer.from("../outside/target");
+    const modified = new Date("2022-01-01T00:00:00Z");
+    const item = descriptor("link", "symlink", target.byteLength, modified, 0o120600);
+    await symlink(target, path);
+    await lutimes(path, modified, modified);
+    const source = new FakeSource(target);
+
+    expect(await materializeSymlink(source, "token", path, item, callbacks(() => undefined))).toEqual({ skipped: true });
+    expect(source.reads).toBe(1);
+    expect((await lstat(path)).mode & 0o777).toBe(0o600);
   });
 
   test("replaces an equal-size, equal-time symlink whose target bytes differ", async () => {
@@ -166,12 +287,23 @@ describe("Restore materializer", () => {
   test("applies directory mode and timestamp after its contents", async () => {
     const root = await temporaryDirectory();
     const modified = new Date("2019-04-05T06:07:08Z");
-    const item = descriptor("folder", "folder", 0, modified, 0o040750);
+    const item = descriptor("folder", "folder", 0, modified, 0o041750);
     await chmod(root, 0o700);
     await finalizeRestoreDirectory(root, item);
     const value = await lstat(root);
-    expect(value.mode & 0o777).toBe(0o750);
+    expect(value.mode & 0o7777).toBe(0o1750);
     expect(Math.trunc(value.mtimeMs)).toBe(modified.getTime());
+  });
+
+  test("temporarily makes an existing archived directory writable for child restoration", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "readonly");
+    await mkdir(path);
+    await chmod(path, 0o555);
+
+    await ensureRestoreDirectory(path, true);
+
+    expect((await lstat(path)).mode & 0o700).toBe(0o700);
   });
 
   test("uses default directory permissions when the archive has no permission bits", async () => {
